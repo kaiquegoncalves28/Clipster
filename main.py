@@ -1,5 +1,6 @@
 import os
 import shutil
+import subprocess
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -10,9 +11,48 @@ import yt_dlp
 
 DEFAULT_OUTPUT_DIR = str(Path.home() / "Downloads")
 
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+def _video_codec(path: str) -> str | None:
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name", "-of", "csv=p=0", path,
+            ],
+            capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW,
+        )
+    except Exception:
+        return None
+    return result.stdout.strip() or None
+
+
+def _reencode_to_h264(path: str) -> bool:
+    """Re-encode in place to H.264/AAC. Returns True on success."""
+    tmp_path = path + ".reencoded.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-i", path,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-c:a", "aac", "-b:a", "192k",
+        tmp_path,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=1800, creationflags=_NO_WINDOW)
+    except Exception:
+        result = None
+    if result is not None and result.returncode == 0 and os.path.exists(tmp_path):
+        os.replace(tmp_path, path)
+        return True
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    return False
 
 
 class DownloaderApp:
@@ -198,20 +238,35 @@ class DownloaderApp:
             pct = (downloaded / total * 100) if total else 0
             self.root.after(0, self._update_progress, pct, "Baixando...")
         elif d["status"] == "finished":
+            # Fallback for formats that skip postprocessing entirely (e.g. a
+            # single progressive stream with no merge/conversion needed) --
+            # _postprocessor_hook won't fire in that case, so this is the
+            # only chance to learn the final filepath for the codec check.
+            filename = d.get("filename")
+            if filename:
+                self._last_filepath = filename
             self.root.after(0, self._update_progress, 100, "Processando...")
 
     def _update_progress(self, pct: float, text: str):
         self.progress["value"] = pct
         self.status_label.config(text=text)
 
+    def _postprocessor_hook(self, d: dict):
+        if d.get("status") == "finished":
+            filepath = d.get("info_dict", {}).get("filepath")
+            if filepath:
+                self._last_filepath = filepath
+
     def _download_worker(self, url: str, mode: str, choice: str):
         out_dir = self.output_dir.get()
         os.makedirs(out_dir, exist_ok=True)
         outtmpl = os.path.join(out_dir, "%(title)s.%(ext)s")
+        self._last_filepath = None
 
         opts = {
             "outtmpl": outtmpl,
             "progress_hooks": [self._progress_hook],
+            "postprocessor_hooks": [self._postprocessor_hook],
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
@@ -233,16 +288,17 @@ class DownloaderApp:
             )
         else:
             height = self.height_options.get(choice)
-            # Prefer H.264 (avc1) since it plays everywhere without extra codecs;
-            # fall back to any codec (e.g. H.265/HEVC) only if H.264 isn't available.
-            if height:
-                fmt = (
-                    f"bestvideo[vcodec^=avc][height<={height}]+bestaudio/best[height<={height}]"
-                    f"/bestvideo[height<={height}]+bestaudio/best[height<={height}]"
-                    f"/best[height<={height}]"
-                )
-            else:
-                fmt = "bestvideo[vcodec^=avc]+bestaudio/best/bestvideo+bestaudio/best/best"
+            # Prefer H.264 (avc1) video + AAC/m4a audio since that combo plays
+            # everywhere without extra codecs. If the site has no H.264 stream
+            # (e.g. some 4K-only sources), we fall back to the best available
+            # and re-encode to H.264 below so playback never breaks.
+            hsuffix = f"[height<={height}]" if height else ""
+            fmt = (
+                f"bestvideo[vcodec^=avc]{hsuffix}+bestaudio[ext=m4a]/"
+                f"bestvideo[vcodec^=avc]{hsuffix}+bestaudio/"
+                f"bestvideo{hsuffix}+bestaudio/"
+                f"best{hsuffix}"
+            )
             opts.update({"format": fmt, "merge_output_format": "mp4"})
 
         try:
@@ -251,7 +307,15 @@ class DownloaderApp:
         except Exception as exc:
             self.root.after(0, self._on_download_error, str(exc))
             return
-        self.root.after(0, self._on_download_success, out_dir)
+
+        reencode_failed = False
+        if mode == "video" and self._last_filepath and os.path.exists(self._last_filepath):
+            codec = _video_codec(self._last_filepath)
+            if codec and codec not in ("h264",):
+                self.root.after(0, self._update_progress, 100, "Convertendo para H.264 (compatibilidade)...")
+                reencode_failed = not _reencode_to_h264(self._last_filepath)
+
+        self.root.after(0, self._on_download_success, out_dir, reencode_failed)
 
     def _on_download_error(self, message: str):
         self.download_btn.config(state="normal")
@@ -259,12 +323,21 @@ class DownloaderApp:
         self.status_label.config(text="Erro no download.")
         messagebox.showerror("Erro", f"Falha ao baixar:\n{message}")
 
-    def _on_download_success(self, out_dir: str):
+    def _on_download_success(self, out_dir: str, reencode_failed: bool = False):
         self.download_btn.config(state="normal")
         self.fetch_btn.config(state="normal")
         self.progress["value"] = 100
         self.status_label.config(text="Download concluído!")
-        messagebox.showinfo("Concluído", f"Download salvo em:\n{out_dir}")
+        if reencode_failed:
+            messagebox.showwarning(
+                "Concluído com aviso",
+                f"Download salvo em:\n{out_dir}\n\n"
+                "O vídeo não usa o codec H.264 e a conversão automática falhou "
+                "(verifique se o ffmpeg instalado suporta libx264). O arquivo pode "
+                "não reproduzir em todos os players.",
+            )
+        else:
+            messagebox.showinfo("Concluído", f"Download salvo em:\n{out_dir}")
 
 
 def main():
